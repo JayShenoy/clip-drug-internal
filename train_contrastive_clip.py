@@ -7,8 +7,15 @@ Dataset:  Mitchell et al. Nat Biotechnol 2023  ("A proteome-wide atlas of drug M
 Architecture
 ────────────
 Chemical Tower  : frozen ChemBERTa-77M-MTR  →  2-layer MLP head  →  D=128
-Proteome Tower  : GCN on the compound-compound Pearson-correlation graph
-                  (same topology as cluster_compounds.py)  →  2-layer MLP head  →  D=128
+Proteome Tower  : Trace Encoder — each compound's log2FC values mapped as node
+                  features onto the protein-protein interactome (MOESM6, Pearson
+                  correlations across all 875 compounds, 35 936 edges, 2 387
+                  proteins).  The continuous, un-thresholded Pearson r is the edge
+                  weight; no hard cutoffs.  A 3-layer multi-head GAT
+                  (torch_geometric.nn.GATConv) aggregates the signal across the
+                  interactome, learning to weight edges natively during
+                  backpropagation.  Global mean pool over all protein nodes
+                  →  2-layer MLP Projection Head  →  D=128
 Loss            : symmetric InfoNCE (CLIP-style) with learnable temperature
 Optimiser       : AdamW + CosineAnnealingLR
 Evaluation      : Top-1 / Top-5 retrieval accuracy on validation set
@@ -34,7 +41,7 @@ from scipy import stats
 from torch.utils.data import DataLoader, Dataset, Subset
 from transformers import AutoModel, AutoTokenizer
 
-from torch_geometric.data import Data as PyGData
+from torch_geometric.data import Data as PyGData, Batch as PyGBatch
 from torch_geometric.nn import GATConv, global_mean_pool
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -50,16 +57,15 @@ WEIGHT_DECAY = 1e-2
 VAL_FRAC = 0.20
 CHECKPOINT_PATH = "best_proteome_clip.pt"
 
-# Graph construction mirrors cluster_compounds.py exactly
-FDR_THRESHOLD = 0.38
-MIN_SHARED = 200
-
 # ChemBERTa checkpoint
 CHEMBERTA_MODEL = "DeepChem/ChemBERTa-77M-MTR"
 MAX_SMILES_LEN = 128
 
-# GCN / GAT dims
-GNN_IN_DIM = 1             # node feature = normalised log2FC centroid (scalar)
+# Protein-protein interactome (MOESM6)
+PPI_FILE = "data/41587_2022_1539_MOESM6_ESM.xlsx"
+
+# GAT dims — node features are scalar (1-dim FC value per protein)
+GNN_IN_DIM = 1
 GNN_HIDDEN = 256
 GNN_HEADS = 4              # GAT attention heads
 
@@ -188,55 +194,61 @@ def build_pearson_graph(
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 3.  Build the PyG graph object
+# 3.  Build the protein-protein interactome graph (fixed topology, MOESM6)
 # ────────────────────────────────────────────────────────────────────────────
 
-def build_pyg_graph(
-    corr_matrix: np.ndarray,
-    count_matrix: np.ndarray,
-    mat_f: np.ndarray,
-    compounds: list[str],
-) -> PyGData:
+def load_ppi_graph(fc_df: pd.DataFrame) -> tuple[PyGData, list[str]]:
     """
-    Construct a PyG Data object representing the full compound-compound
-    correlation graph.
+    Load the protein-protein Pearson correlation network (MOESM6) and
+    intersect with proteins present in the FC matrix.
 
-    Node features  : mean log2FC across all proteins (1-D, normalised).
-    Edge index     : pairs (i, j) where r >= FDR_THRESHOLD and
-                     shared_proteins >= MIN_SHARED  —  identical to
-                     cluster_compounds.py step 3.
-    Edge attributes: Pearson r (scalar).
+    Returns
+    -------
+    ppi_graph      : PyGData with placeholder zero node features (shape N×1);
+                     real features are filled per-compound at training time.
+    prot_order     : list of protein names (length N) — the canonical node order.
     """
-    n = len(compounds)
+    print("Loading protein-protein interactome (MOESM6) …")
+    wb = openpyxl.load_workbook(PPI_FILE, read_only=True)
+    ws = wb.worksheets[0]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
 
-    # Node feature: per-compound mean log2FC (nanmean across proteins), z-scored
-    node_means = np.nanmean(mat_f, axis=0)                      # (N,)
-    node_means = np.nan_to_num(node_means, nan=0.0)
-    mu, sigma = node_means.mean(), node_means.std() + 1e-8
-    node_feats = ((node_means - mu) / sigma).reshape(-1, 1).astype(np.float32)  # (N,1)
-
-    # Edges: same threshold as cluster_compounds.py
+    fc_proteins = set(fc_df.index.tolist())
     src_list, dst_list, w_list = [], [], []
-    for i in range(n):
-        for j in range(i + 1, n):
-            r = corr_matrix[i, j]
-            cnt = count_matrix[i, j]
-            if not np.isnan(r) and r >= FDR_THRESHOLD and cnt >= MIN_SHARED:
-                src_list += [i, j]          # undirected → both directions
-                dst_list += [j, i]
-                w_list += [r, r]
+    prot_set: set[str] = set()
+    for row in rows[1:]:
+        p1, p2, r = str(row[0]), str(row[1]), float(row[2])
+        if p1 in fc_proteins and p2 in fc_proteins:
+            prot_set.add(p1)
+            prot_set.add(p2)
+            src_list.append(p1)
+            dst_list.append(p2)
+            w_list.append(r)
 
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    edge_attr = torch.tensor(w_list, dtype=torch.float32).unsqueeze(1)  # (E, 1)
-    x = torch.tensor(node_feats, dtype=torch.float32)
+    # Canonical protein ordering (sorted for reproducibility)
+    prot_order = sorted(prot_set)
+    prot_idx = {p: i for i, p in enumerate(prot_order)}
+    n = len(prot_order)
 
-    graph = PyGData(x=x, edge_index=edge_index, edge_attr=edge_attr)
-    graph.num_nodes = n
+    # Build bidirectional edge index
+    srcs = [prot_idx[p] for p in src_list]
+    dsts = [prot_idx[p] for p in dst_list]
+    srcs_bi = srcs + dsts
+    dsts_bi = dsts + srcs
+    ws_bi = w_list + w_list
+
+    edge_index = torch.tensor([srcs_bi, dsts_bi], dtype=torch.long)
+    edge_attr  = torch.tensor(ws_bi, dtype=torch.float32).unsqueeze(1)  # (E, 1)
+    x          = torch.zeros(n, 1, dtype=torch.float32)                 # placeholder
+
+    ppi_graph = PyGData(x=x, edge_index=edge_index, edge_attr=edge_attr)
+    ppi_graph.num_nodes = n
     print(
-        f"  PyG graph: {n} nodes, {len(src_list)//2} undirected edges "
-        f"(r >= {FDR_THRESHOLD}, shared >= {MIN_SHARED})"
+        f"  PPI graph: {n} proteins (FC∩PPI overlap), "
+        f"{len(w_list)} undirected edges, continuous Pearson r weights"
     )
-    return graph
+    return ppi_graph, prot_order
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -245,34 +257,40 @@ def build_pyg_graph(
 
 class ProteomeCLIPDataset(Dataset):
     """
-    Each item is a (smiles_str, compound_idx, fc_vector) triple where
-    compound_idx is the node index in the PyG graph.
-
-    fc_vector : float32 tensor of shape (P_full,) — the full 9960-protein
-                log2FC profile for that compound, NaN-filled where missing.
-                Used as a raw input alternative / debugging aid; the GNN
-                receives the graph node features, not this vector directly.
+    Each item is a (smiles_str, fc_node_feats) pair where fc_node_feats is a
+    (N_prot, 1) float32 tensor — the z-scored log2FC value for each protein
+    node in the PPI graph for that compound (NaN → 0).
     """
 
     def __init__(
         self,
         smiles_list: list[str],
-        compound_indices: list[int],
-        fc_matrix: np.ndarray,   # (P, N) float32
+        compound_keys: list[str],      # FC matrix column names for each compound
+        fc_df: pd.DataFrame,           # proteins × compounds, NaN for missing
+        prot_order: list[str],         # canonical protein node order (length N_prot)
     ):
         self.smiles = smiles_list
-        self.indices = compound_indices
-        # Each compound's FC profile stored as a tensor row (proteins × 1 each)
-        fc_T = fc_matrix.T  # (N, P)
-        fc_T = np.nan_to_num(fc_T, nan=0.0).astype(np.float32)
-        self.fc_vectors = torch.from_numpy(fc_T)  # (N, P)
+
+        # Subset FC matrix to PPI proteins in canonical order, fill NaN→0
+        fc_sub = fc_df.reindex(index=prot_order)   # (N_prot, N_compounds)
+        fc_sub = fc_sub[compound_keys]              # (N_prot, B_compounds)
+
+        # Z-score each protein row across the compounds present in this dataset
+        fc_np = fc_sub.values.astype(np.float32)   # (N_prot, B)
+        mu    = np.nanmean(fc_np, axis=1, keepdims=True)
+        sigma = np.nanstd(fc_np, axis=1, keepdims=True) + 1e-8
+        fc_z  = (fc_np - mu) / sigma                # (N_prot, B)
+        fc_z  = np.nan_to_num(fc_z, nan=0.0)
+
+        # Shape: (B, N_prot, 1) — one feature vector per compound
+        fc_z_T = fc_z.T[:, :, np.newaxis]          # (B, N_prot, 1)
+        self.fc_tensors = torch.from_numpy(fc_z_T.astype(np.float32))  # (B, N_prot, 1)
 
     def __len__(self) -> int:
         return len(self.smiles)
 
     def __getitem__(self, idx: int):
-        node_idx = self.indices[idx]
-        return self.smiles[idx], node_idx, self.fc_vectors[node_idx]
+        return self.smiles[idx], self.fc_tensors[idx]  # (smiles, (N_prot, 1))
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -319,38 +337,48 @@ class ChemicalTower(nn.Module):
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# 6.  Proteome Tower: GAT on the compound-compound graph + MLP head
+# 6.  Proteome Tower: multi-layer GAT on the compound graph + global pool + MLP
 # ────────────────────────────────────────────────────────────────────────────
 
 class ProteomeTower(nn.Module):
     """
-    Graph Attention Network operating over the compound-compound Pearson
-    correlation graph built with the same parameters as cluster_compounds.py.
+    Trace Encoder: three-layer GAT over the protein-protein interactome.
 
-    The GNN is trained from scratch.  After message-passing we extract the
-    embedding for each queried node via index-based selection, then project
-    to the shared latent space.
+    For each compound, node features are the scalar log2FC value at each
+    protein (z-scored, NaN→0).  The fixed graph topology comes from the
+    MOESM6 protein-protein Pearson correlation network; edge weights are
+    continuous Pearson r with no hard threshold.  The GAT uses multi-head
+    attention to dynamically weight edges during backpropagation.  After
+    message-passing, global mean pooling over all protein nodes collapses
+    the graph to a single compound embedding, projected to D=128.
     """
 
     def __init__(
         self,
-        in_dim: int = GNN_IN_DIM,
+        in_dim: int = GNN_IN_DIM,  # 1 — scalar FC value per protein
         hidden_dim: int = GNN_HIDDEN,
         heads: int = GNN_HEADS,
         latent_dim: int = LATENT_DIM,
         mlp_hidden: int = MLP_HIDDEN,
     ):
         super().__init__()
-        # Two GAT layers with edge-feature awareness
         self.conv1 = GATConv(
             in_channels=in_dim,
             out_channels=hidden_dim,
             heads=heads,
-            edge_dim=1,           # pass Pearson r as edge attribute
+            edge_dim=1,
             concat=True,
             dropout=0.1,
         )
         self.conv2 = GATConv(
+            in_channels=hidden_dim * heads,
+            out_channels=hidden_dim,
+            heads=heads,
+            edge_dim=1,
+            concat=True,
+            dropout=0.1,
+        )
+        self.conv3 = GATConv(
             in_channels=hidden_dim * heads,
             out_channels=hidden_dim,
             heads=1,
@@ -359,7 +387,8 @@ class ProteomeTower(nn.Module):
             dropout=0.1,
         )
         self.norm1 = nn.LayerNorm(hidden_dim * heads)
-        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim * heads)
+        self.norm3 = nn.LayerNorm(hidden_dim)
 
         # 2-layer MLP projection head
         self.projector = nn.Sequential(
@@ -371,10 +400,10 @@ class ProteomeTower(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,           # (N_graph, in_dim)
-        edge_index: torch.Tensor,  # (2, E)
-        edge_attr: torch.Tensor,   # (E, 1)
-        node_indices: torch.Tensor,  # (B,) indices of the B queried compounds
+        x: torch.Tensor,            # (N_graph, P)
+        edge_index: torch.Tensor,   # (2, E)
+        edge_attr: torch.Tensor,    # (E, 1)
+        batch: torch.Tensor,        # (N_graph,) batch assignment vector
     ) -> torch.Tensor:
         h = self.conv1(x, edge_index, edge_attr=edge_attr)
         h = self.norm1(h)
@@ -382,9 +411,12 @@ class ProteomeTower(nn.Module):
         h = self.conv2(h, edge_index, edge_attr=edge_attr)
         h = self.norm2(h)
         h = F.gelu(h)
-        # Select embeddings for the B queried nodes
-        h_batch = h[node_indices]          # (B, hidden_dim)
-        return self.projector(h_batch)     # (B, D)
+        h = self.conv3(h, edge_index, edge_attr=edge_attr)
+        h = self.norm3(h)
+        h = F.gelu(h)
+        # Global mean pool: (N_graph, hidden) → (B, hidden)
+        h_pooled = global_mean_pool(h, batch)
+        return self.projector(h_pooled)    # (B, D)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -411,11 +443,11 @@ class ProteomeCLIP(nn.Module):
         graph_x: torch.Tensor,
         graph_edge_index: torch.Tensor,
         graph_edge_attr: torch.Tensor,
-        node_indices: torch.Tensor,
+        batch: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         z_chem = self.chem_tower(input_ids, attention_mask)        # (B, D)
         z_prot = self.prot_tower(
-            graph_x, graph_edge_index, graph_edge_attr, node_indices
+            graph_x, graph_edge_index, graph_edge_attr, batch
         )  # (B, D)
         # L2-normalise both embeddings
         z_chem = F.normalize(z_chem, dim=-1)
@@ -450,11 +482,29 @@ def info_nce_loss(
 # 9.  Retrieval evaluation  (Top-K accuracy)
 # ────────────────────────────────────────────────────────────────────────────
 
+def make_collate(ppi_graph: PyGData):
+    """
+    Returns a collate_fn that stamps per-compound FC vectors onto the fixed
+    PPI graph topology, producing a PyGBatch of B protein graphs.
+    """
+    ei = ppi_graph.edge_index   # shared, will be replicated by PyGBatch
+    ea = ppi_graph.edge_attr
+
+    def collate(batch: list) -> tuple[list[str], PyGBatch]:
+        smiles_list = [item[0] for item in batch]
+        graphs = [
+            PyGData(x=item[1], edge_index=ei, edge_attr=ea)
+            for item in batch
+        ]
+        return smiles_list, PyGBatch.from_data_list(graphs)
+
+    return collate
+
+
 @torch.no_grad()
 def retrieval_accuracy(
     model: ProteomeCLIP,
     loader: DataLoader,
-    graph: PyGData,
     ks: tuple[int, ...] = (1, 5),
 ) -> dict[str, float]:
     """
@@ -463,17 +513,16 @@ def retrieval_accuracy(
     compound's chemistry embedding, and report hit-rate at rank K.
     """
     model.eval()
-    gx = graph.x.to(DEVICE)
-    ge = graph.edge_index.to(DEVICE)
-    ga = graph.edge_attr.to(DEVICE)
-
     all_z_chem, all_z_prot = [], []
-    for smiles_batch, node_idx_batch, _ in loader:
+    for smiles_batch, pyg_batch in loader:
         enc = model.chem_tower.tokenize(list(smiles_batch))
         input_ids = enc["input_ids"].to(DEVICE)
         attn_mask = enc["attention_mask"].to(DEVICE)
-        ni = node_idx_batch.to(DEVICE)
-        z_c, z_p = model(input_ids, attn_mask, gx, ge, ga, ni)
+        pyg_batch = pyg_batch.to(DEVICE)
+        z_c, z_p = model(
+            input_ids, attn_mask,
+            pyg_batch.x, pyg_batch.edge_index, pyg_batch.edge_attr, pyg_batch.batch,
+        )
         all_z_chem.append(z_c.cpu())
         all_z_prot.append(z_p.cpu())
 
@@ -497,49 +546,52 @@ def train_one_epoch(
     model: ProteomeCLIP,
     loader: DataLoader,
     optimiser: torch.optim.Optimizer,
-    graph: PyGData,
 ) -> float:
     model.train()
-    gx = graph.x.to(DEVICE)
-    ge = graph.edge_index.to(DEVICE)
-    ga = graph.edge_attr.to(DEVICE)
     total_loss = 0.0
-    for smiles_batch, node_idx_batch, _ in loader:
+    n_samples = 0
+    for smiles_batch, pyg_batch in loader:
         enc = model.chem_tower.tokenize(list(smiles_batch))
         input_ids = enc["input_ids"].to(DEVICE)
         attn_mask = enc["attention_mask"].to(DEVICE)
-        ni = node_idx_batch.to(DEVICE)
-        z_c, z_p = model(input_ids, attn_mask, gx, ge, ga, ni)
+        pyg_batch = pyg_batch.to(DEVICE)
+        z_c, z_p = model(
+            input_ids, attn_mask,
+            pyg_batch.x, pyg_batch.edge_index, pyg_batch.edge_attr, pyg_batch.batch,
+        )
         loss = info_nce_loss(z_c, z_p, model.temperature)
         optimiser.zero_grad()
         loss.backward()
-        # Gradient clip for stability
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimiser.step()
-        total_loss += loss.item() * len(smiles_batch)
-    return total_loss / len(loader.dataset)
+        b = len(smiles_batch)
+        total_loss += loss.item() * b
+        n_samples += b
+    return total_loss / n_samples
 
 
 @torch.no_grad()
 def eval_one_epoch(
     model: ProteomeCLIP,
     loader: DataLoader,
-    graph: PyGData,
 ) -> float:
     model.eval()
-    gx = graph.x.to(DEVICE)
-    ge = graph.edge_index.to(DEVICE)
-    ga = graph.edge_attr.to(DEVICE)
     total_loss = 0.0
-    for smiles_batch, node_idx_batch, _ in loader:
+    n_samples = 0
+    for smiles_batch, pyg_batch in loader:
         enc = model.chem_tower.tokenize(list(smiles_batch))
         input_ids = enc["input_ids"].to(DEVICE)
         attn_mask = enc["attention_mask"].to(DEVICE)
-        ni = node_idx_batch.to(DEVICE)
-        z_c, z_p = model(input_ids, attn_mask, gx, ge, ga, ni)
+        pyg_batch = pyg_batch.to(DEVICE)
+        z_c, z_p = model(
+            input_ids, attn_mask,
+            pyg_batch.x, pyg_batch.edge_index, pyg_batch.edge_attr, pyg_batch.batch,
+        )
         loss = info_nce_loss(z_c, z_p, model.temperature)
-        total_loss += loss.item() * len(smiles_batch)
-    return total_loss / len(loader.dataset)
+        b = len(smiles_batch)
+        total_loss += loss.item() * b
+        n_samples += b
+    return total_loss / n_samples
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -553,27 +605,24 @@ def main() -> None:
     fc_df = load_fc_matrix()
     smiles_df = load_smiles_table()
 
-    # ── 11b. Build Pearson graph (same as cluster_compounds.py) ─────────────
-    corr_matrix, count_matrix, mat_f, compounds = build_pearson_graph(fc_df)
+    # ── 11b. Load protein-protein interactome ────────────────────────────────
+    ppi_graph, prot_order = load_ppi_graph(fc_df)
 
-    # ── 11c. Build PyG graph ─────────────────────────────────────────────────
-    graph = build_pyg_graph(corr_matrix, count_matrix, mat_f, compounds)
-
-    # ── 11d. Match SMILES ↔ FC compounds ────────────────────────────────────
-    comp_to_idx = {c: i for i, c in enumerate(compounds)}
-    valid_smiles, valid_indices = [], []
+    # ── 11c. Match SMILES ↔ FC compounds ────────────────────────────────────
+    fc_col_set = set(fc_df.columns.tolist())
+    valid_smiles, valid_fc_keys = [], []
     for _, row in smiles_df.iterrows():
         key = row["fc_key"]
-        if key in comp_to_idx:
+        if key in fc_col_set:
             smi = str(row["SMILES"]).strip()
             if smi and smi.lower() != "nan":
                 valid_smiles.append(smi)
-                valid_indices.append(comp_to_idx[key])
+                valid_fc_keys.append(key)
 
     print(f"\nMatched {len(valid_smiles)} SMILES ↔ FC profiles")
 
-    # ── 11e. Dataset + 80/20 split ───────────────────────────────────────────
-    dataset = ProteomeCLIPDataset(valid_smiles, valid_indices, mat_f)
+    # ── 11d. Dataset + 80/20 split ───────────────────────────────────────────
+    dataset = ProteomeCLIPDataset(valid_smiles, valid_fc_keys, fc_df, prot_order)
     n_total = len(dataset)
     n_val = max(1, int(n_total * VAL_FRAC))
     n_train = n_total - n_val
@@ -584,16 +633,17 @@ def main() -> None:
     val_set = Subset(dataset, val_idx)
     print(f"  Train: {len(train_set)}  |  Val: {len(val_set)}")
 
+    collate_fn = make_collate(ppi_graph)
     train_loader = DataLoader(
         train_set, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, drop_last=True,
+        num_workers=0, drop_last=True, collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_set, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=0, drop_last=False,
+        num_workers=0, drop_last=False, collate_fn=collate_fn,
     )
 
-    # ── 11f. Model ───────────────────────────────────────────────────────────
+    # ── 11e. Model ───────────────────────────────────────────────────────────
     print("\nBuilding model …")
     model = ProteomeCLIP().to(DEVICE)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -621,9 +671,9 @@ def main() -> None:
     print("─" * len(header))
 
     for epoch in range(1, EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimiser, graph)
-        val_loss = eval_one_epoch(model, val_loader, graph)
-        retrieval = retrieval_accuracy(model, val_loader, graph, ks=(1, 5))
+        train_loss = train_one_epoch(model, train_loader, optimiser)
+        val_loss = eval_one_epoch(model, val_loader)
+        retrieval = retrieval_accuracy(model, val_loader, ks=(1, 5))
         scheduler.step()
 
         temp_val = model.temperature.item()
@@ -655,9 +705,9 @@ def main() -> None:
                     "top1": retrieval["top1"],
                     "top5": retrieval["top5"],
                     "temperature": temp_val,
-                    "compounds": compounds,
+                    "prot_order": prot_order,
                     "valid_smiles": valid_smiles,
-                    "valid_indices": valid_indices,
+                    "valid_fc_keys": valid_fc_keys,
                 },
                 CHECKPOINT_PATH,
             )

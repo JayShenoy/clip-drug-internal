@@ -90,7 +90,8 @@ class TrainConfig:
     ppi_file: str = "data/41587_2022_1539_MOESM6_ESM.xlsx"
 
     # ── mlp options ──────────────────────────────────────────────────────────
-    mlp_enc_hidden: int = 1024    # hidden width of the flat proteome MLP
+    mlp_enc_hidden:  int   = 512    # hidden width of the flat proteome MLP
+    mlp_enc_dropout: float = 0.3    # dropout between MLP layers
 
     # ── deepset options ──────────────────────────────────────────────────────
     deepset_hidden:  int  = 256   # width of per-protein element MLP
@@ -407,14 +408,17 @@ class MLPEncoder(nn.Module):
 
     def __init__(self, n_proteins: int):
         super().__init__()
-        H = cfg.mlp_enc_hidden
+        H  = cfg.mlp_enc_hidden
+        dp = cfg.mlp_enc_dropout
         self.net = nn.Sequential(
             nn.Linear(n_proteins, H),
             nn.GELU(),
             nn.LayerNorm(H),
+            nn.Dropout(dp),
             nn.Linear(H, H),
             nn.GELU(),
             nn.LayerNorm(H),
+            nn.Dropout(dp),
             nn.Linear(H, cfg.latent_dim),
         )
 
@@ -566,7 +570,12 @@ class ProteomeEncoderFactory:
         encoder = ProteomeEncoderFactory.build(n_proteins=2387)
     """
 
-    VALID = ("mlp", "deepset", "gnn", "transformer")
+    # NOTE: 'gnn' is disabled pending replacement of the MOESM6 protein-protein
+    # edge network with a curated STRING-DB interactome.  The current MOESM6
+    # edges are Pearson correlations derived from the same FC matrix used for
+    # training, which introduces data leakage into the graph topology.
+    # Re-enable 'gnn' once STRING-DB edges are wired into load_ppi_graph().
+    VALID = ("mlp", "deepset", "transformer")
 
     @staticmethod
     def build(n_proteins: int) -> nn.Module:
@@ -595,11 +604,12 @@ class ProteomeCLIP(nn.Module):
         self.prot_tower  = ProteomeEncoderFactory.build(n_proteins)
         self.encoder_type = cfg.encoder_type
         # Learnable log-temperature: initialised to log(1/0.07) ≈ 2.659
+        # Capped at log(10) ≈ 2.303 to prevent runaway sharpening
         self.log_temp = nn.Parameter(torch.tensor(math.log(1.0 / 0.07)))
 
     @property
     def temperature(self) -> torch.Tensor:
-        return torch.exp(torch.clamp(self.log_temp, max=math.log(100.0)))
+        return torch.exp(torch.clamp(self.log_temp, max=math.log(10.0)))
 
     def encode_proteome(self, proteome_data) -> torch.Tensor:
         """
@@ -730,7 +740,16 @@ def main() -> None:
     smiles_df = load_smiles_table()
 
     # ── 11b. Load protein-protein interactome ────────────────────────────────
-    ppi_graph, prot_order = load_ppi_graph(fc_df)
+    # prot_order drives node feature construction in the Dataset.
+    # For 'gnn' we restrict to PPI-covered proteins (graph nodes).
+    # For all other encoders we use every protein in the FC matrix so no
+    # signal is discarded.
+    ppi_graph, ppi_prot_order = load_ppi_graph(fc_df)
+    if cfg.encoder_type == "gnn":
+        prot_order = ppi_prot_order
+    else:
+        prot_order = sorted(fc_df.index.tolist())
+        print(f"  Using all {len(prot_order)} FC proteins as encoder input")
     n_proteins = len(prot_order)
 
     # ── 11c. Match SMILES ↔ FC compounds ────────────────────────────────────
@@ -784,8 +803,8 @@ def main() -> None:
     )
 
     # ── 11g. Training loop ───────────────────────────────────────────────────
-    best_val_loss = float("inf")
-    history       = []
+    best_top1  = -1.0
+    history    = []
     print(f"\nTraining for {cfg.epochs} epochs …\n")
     header = (
         f"{'Epoch':>5}  {'Train Loss':>10}  {'Val Loss':>10}"
@@ -812,8 +831,8 @@ def main() -> None:
             f"  {temp_val:>6.3f}"
         )
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if retrieval["top1"] > best_top1:
+            best_top1 = retrieval["top1"]
             torch.save(
                 {
                     "epoch": epoch,
@@ -833,7 +852,7 @@ def main() -> None:
             print(f"  ✓ New best checkpoint saved → {cfg.checkpoint}")
 
     # ── 11h. Final summary ───────────────────────────────────────────────────
-    best = min(history, key=lambda r: r["val_loss"])
+    best = max(history, key=lambda r: r["top1"])
     print(f"\n{'─' * 60}")
     print(f"Encoder     : {cfg.encoder_type}")
     print(f"Best epoch  : {best['epoch']}")

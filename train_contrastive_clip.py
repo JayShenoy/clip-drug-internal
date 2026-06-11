@@ -81,6 +81,7 @@ class TrainConfig:
     weight_decay:  float = 1e-2
     val_frac:      float = 0.20
     checkpoint:    str   = "best_proteome_clip.pt"
+    checkpoint_loss: str = "lowest_loss_proteome_clip.pt"
 
     # ── chemical tower ───────────────────────────────────────────────────────
     chemberta_model: str = "DeepChem/ChemBERTa-77M-MTR"
@@ -803,7 +804,8 @@ def main() -> None:
     )
 
     # ── 11g. Training loop ───────────────────────────────────────────────────
-    best_top1  = -1.0
+    best_top1      = -1.0
+    best_train_loss = math.inf
     history    = []
     print(f"\nTraining for {cfg.epochs} epochs …\n")
     header = (
@@ -831,25 +833,30 @@ def main() -> None:
             f"  {temp_val:>6.3f}"
         )
 
+        ckpt_payload = {
+            "epoch": epoch,
+            "encoder_type": cfg.encoder_type,
+            "model_state_dict": model.state_dict(),
+            "optimiser_state_dict": optimiser.state_dict(),
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "top1": retrieval["top1"],
+            "top5": retrieval["top5"],
+            "temperature": temp_val,
+            "prot_order": prot_order,
+            "valid_smiles": valid_smiles,
+            "valid_fc_keys": valid_fc_keys,
+        }
+
         if retrieval["top1"] > best_top1:
             best_top1 = retrieval["top1"]
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "encoder_type": cfg.encoder_type,
-                    "model_state_dict": model.state_dict(),
-                    "optimiser_state_dict": optimiser.state_dict(),
-                    "val_loss": val_loss,
-                    "top1": retrieval["top1"],
-                    "top5": retrieval["top5"],
-                    "temperature": temp_val,
-                    "prot_order": prot_order,
-                    "valid_smiles": valid_smiles,
-                    "valid_fc_keys": valid_fc_keys,
-                },
-                cfg.checkpoint,
-            )
-            print(f"  ✓ New best checkpoint saved → {cfg.checkpoint}")
+            torch.save(ckpt_payload, cfg.checkpoint)
+            print(f"  ✓ New best Top-1 checkpoint saved → {cfg.checkpoint}")
+
+        if train_loss < best_train_loss:
+            best_train_loss = train_loss
+            torch.save(ckpt_payload, cfg.checkpoint_loss)
+            print(f"  ✓ New lowest train-loss checkpoint saved → {cfg.checkpoint_loss}")
 
     # ── 11h. Final summary ───────────────────────────────────────────────────
     best = max(history, key=lambda r: r["top1"])

@@ -1,14 +1,15 @@
 [workspace]
 authors = ["Jay Shenoy <jay@jayshenoy.com>"]
-channels = ["conda-forge"]
+channels = ["conda-forge", "nvidia", "pytorch"]
 name = "clip-drug-internal"
-platforms = ["osx-arm64"]
+platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+install-torch-cuda = "pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124"
 
 [dependencies]
-python = ">=3.14.5,<3.15"
+python = ">=3.13,<3.14"
 pandas = ">=3.0.3,<4"
 numpy = ">=2.4.6,<3"
 scipy = ">=1.17.1,<2"
@@ -16,7 +17,7 @@ matplotlib = ">=3.10.9,<4"
 seaborn = ">=0.13.2,<0.14"
 networkx = ">=3.6.1,<4"
 python-louvain = ">=0.16,<0.17"
-pytorch = "*"
+pip = ">=25.0"
 rdkit = "*"
 
 [pypi-dependencies]

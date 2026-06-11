@@ -10,6 +10,9 @@ Algorithm (Fig. 4a + Methods):
 5. Visualize network with node colors = community, edge width = correlation strength
 """
 
+import json
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 from scipy import stats
@@ -23,6 +26,9 @@ import matplotlib.colors as mcolors
 from matplotlib.lines import Line2D
 import warnings
 warnings.filterwarnings("ignore")
+
+PEARSON_CACHE = Path("data/pearson_cache.npz")
+CLUSTER_CACHE = Path("data/cluster_results.json")
 
 # ── 1. Load data ──────────────────────────────────────────────────────────────
 print("Loading data...")
@@ -43,37 +49,55 @@ print(f"  Matrix shape: {df.shape[0]} proteins x {df.shape[1]} compounds")
 # ── 2. Pearson correlation between compounds ──────────────────────────────────
 # Paper: correlations calculated on proteins quantified in >= 200 compounds
 # (stated as using rcorr from Hmisc in R, pairwise complete obs)
-print("Computing pairwise Pearson correlations (pairwise complete obs)...")
 
 compounds = df.columns.tolist()
 n = len(compounds)
 mat = df.values  # shape: proteins x compounds
-
-# Vectorised pairwise Pearson with pairwise complete observations
-# For each pair (i,j) use rows where both are non-NaN
-corr_matrix = np.full((n, n), np.nan)
-count_matrix = np.zeros((n, n), dtype=int)
-
-# Convert to float32 for speed; work column-wise
 mat_f = mat.astype(np.float32)
 
-# Chunk computation to avoid OOM (875 x 875 = fine)
-for i in range(n):
-    xi = mat_f[:, i]
-    for j in range(i, n):
-        xj = mat_f[:, j]
-        mask = ~(np.isnan(xi) | np.isnan(xj))
-        cnt = mask.sum()
-        count_matrix[i, j] = count_matrix[j, i] = cnt
-        if cnt >= 3:
-            r, _ = stats.pearsonr(xi[mask], xj[mask])
-            corr_matrix[i, j] = corr_matrix[j, i] = r
-        else:
-            corr_matrix[i, j] = corr_matrix[j, i] = np.nan
-    if i % 100 == 0:
-        print(f"  {i}/{n}...")
+if PEARSON_CACHE.exists():
+    print("Loading cached Pearson matrices...")
+    cache = np.load(PEARSON_CACHE, allow_pickle=True)
+    cached_compounds = cache["compounds"].tolist()
+    if cached_compounds == compounds:
+        corr_matrix = cache["corr_matrix"]
+        count_matrix = cache["count_matrix"]
+        print("  Done (from cache).")
+    else:
+        print("  Cache compound list mismatch — recomputing ...")
+        PEARSON_CACHE.unlink()
+        corr_matrix = None
+else:
+    corr_matrix = None
 
-print("  Done.")
+if corr_matrix is None:
+    print("Computing pairwise Pearson correlations (pairwise complete obs)...")
+    corr_matrix = np.full((n, n), np.nan)
+    count_matrix = np.zeros((n, n), dtype=int)
+
+    for i in range(n):
+        xi = mat_f[:, i]
+        for j in range(i, n):
+            xj = mat_f[:, j]
+            mask = ~(np.isnan(xi) | np.isnan(xj))
+            cnt = mask.sum()
+            count_matrix[i, j] = count_matrix[j, i] = cnt
+            if cnt >= 3:
+                r, _ = stats.pearsonr(xi[mask], xj[mask])
+                corr_matrix[i, j] = corr_matrix[j, i] = r
+            else:
+                corr_matrix[i, j] = corr_matrix[j, i] = np.nan
+        if i % 100 == 0:
+            print(f"  {i}/{n}...")
+
+    print("  Done.")
+    np.savez_compressed(
+        PEARSON_CACHE,
+        corr_matrix=corr_matrix.astype(np.float32),
+        count_matrix=count_matrix.astype(np.int32),
+        compounds=np.array(compounds),
+    )
+    print(f"  Pearson matrices cached → {PEARSON_CACHE}")
 
 # ── 3. Filter: r >= 0.38 (0.1% FDR), remove pairs with < 200 shared proteins ─
 # Paper Methods: "correlations using fewer than 200 datapoints were removed"
@@ -116,6 +140,31 @@ for cid, members in sorted_comms[:10]:
 # Remap community IDs to size-rank order
 id_remap = {old_id: new_id for new_id, (old_id, _) in enumerate(sorted_comms)}
 partition_ranked = {node: id_remap[cid] for node, cid in partition.items()}
+
+# Save quantitative results for cross-checking and fast replot
+cluster_results = {
+    "n_nodes": G_main.number_of_nodes(),
+    "n_edges": G_main.number_of_edges(),
+    "n_communities": len(sorted_comms),
+    "fdr_threshold": FDR_THRESHOLD,
+    "min_shared": MIN_SHARED,
+    "communities": [
+        {
+            "rank": rank,
+            "size": len(members),
+            "members": members,
+        }
+        for rank, (_, members) in enumerate(sorted_comms)
+    ],
+    "partition": partition_ranked,
+    "edge_list": [
+        {"u": u, "v": v, "weight": float(G_main[u][v]["weight"])}
+        for u, v in G_main.edges()
+    ],
+}
+with open(CLUSTER_CACHE, "w") as f:
+    json.dump(cluster_results, f)
+print(f"  Cluster results saved → {CLUSTER_CACHE}")
 
 # ── 5. Layout ─────────────────────────────────────────────────────────────────
 print("Computing layout (community-aware spring)...")

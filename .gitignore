@@ -3,3 +3,4 @@
 !.pixi/config.toml
 
 .DS_Store
+*.pt

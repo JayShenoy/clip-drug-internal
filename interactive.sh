@@ -1,0 +1,1 @@
+srun --pty --partition=gpu --gpus-per-task=1 --cpus-per-task=16 --ntasks=1 --mem=64G --constraint=a100 --time=0-4 --job-name=interactive /bin/bash

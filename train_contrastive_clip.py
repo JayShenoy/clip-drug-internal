@@ -125,12 +125,17 @@ def load_smiles_table() -> pd.DataFrame:
     return df
 
 
+PEARSON_CACHE = Path("data/pearson_cache.npz")
+
+
 def build_pearson_graph(
     fc_df: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
     """
     Compute pairwise Pearson correlations with pairwise-complete observations.
     Mirrors the exact loop in cluster_compounds.py.
+
+    Results are cached to PEARSON_CACHE and reloaded on subsequent runs.
 
     Returns
     -------
@@ -141,9 +146,20 @@ def build_pearson_graph(
     """
     print("Building Pearson correlation graph (mirrors cluster_compounds.py) …")
     compounds = fc_df.columns.tolist()
-    n = len(compounds)
     mat_f = fc_df.values.astype(np.float32)  # proteins × compounds
 
+    if PEARSON_CACHE.exists():
+        print(f"  Loading cached Pearson matrices from {PEARSON_CACHE} …")
+        cache = np.load(PEARSON_CACHE, allow_pickle=True)
+        cached_compounds = cache["compounds"].tolist()
+        if cached_compounds == compounds:
+            corr_matrix = cache["corr_matrix"]
+            count_matrix = cache["count_matrix"]
+            print("  Done (from cache).")
+            return corr_matrix, count_matrix, mat_f, compounds
+        print("  Cache compound list mismatch — recomputing …")
+
+    n = len(compounds)
     corr_matrix = np.full((n, n), np.nan, dtype=np.float32)
     count_matrix = np.zeros((n, n), dtype=np.int32)
 
@@ -161,6 +177,13 @@ def build_pearson_graph(
             print(f"  Pearson {i}/{n} …")
 
     print("  Done.")
+    np.savez_compressed(
+        PEARSON_CACHE,
+        corr_matrix=corr_matrix,
+        count_matrix=count_matrix,
+        compounds=np.array(compounds),
+    )
+    print(f"  Pearson matrices cached → {PEARSON_CACHE}")
     return corr_matrix, count_matrix, mat_f, compounds
 
 

@@ -70,13 +70,13 @@ class TrainConfig:
     encoder_type: str = "mlp"
 
     # ── shared dims ──────────────────────────────────────────────────────────
-    latent_dim: int  = 128    # shared CLIP embedding dimension D
+    latent_dim: int  = 128      # shared CLIP embedding dimension D
     mlp_hidden: int  = 512    # hidden width of projection MLPs
 
     # ── training ─────────────────────────────────────────────────────────────
     seed:          int   = 42
     batch_size:    int   = 64
-    epochs:        int   = 50
+    epochs:        int   = 100
     lr:            float = 3e-4
     weight_decay:  float = 1e-2
     val_frac:      float = 0.20
